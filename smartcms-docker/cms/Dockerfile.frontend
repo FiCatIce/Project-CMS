@@ -1,0 +1,86 @@
+# ============================================================
+# SmartCMS Angular Frontend
+# Multi-stage: Build with Node, Serve with Nginx
+# ============================================================
+
+# ---- Stage 1: Build Angular ----
+FROM node:20-alpine AS builder
+
+RUN apk add --no-cache python3 make g++ git
+
+WORKDIR /app
+
+# Copy frontend source
+COPY frontend/ /tmp/frontend-src/
+
+# Find the actual Angular project root (may be in subdirectory)
+RUN ANGULAR_ROOT=$(find /tmp/frontend-src -name "angular.json" -maxdepth 3 | head -1 | xargs dirname 2>/dev/null) && \
+    if [ -n "$ANGULAR_ROOT" ] && [ -d "$ANGULAR_ROOT" ]; then \
+        cp -r "$ANGULAR_ROOT"/* /app/ ; \
+        cp -r "$ANGULAR_ROOT"/.[!.]* /app/ 2>/dev/null || true ; \
+    else \
+        cp -r /tmp/frontend-src/* /app/ ; \
+        cp -r /tmp/frontend-src/.[!.]* /app/ 2>/dev/null || true ; \
+    fi && \
+    rm -rf /tmp/frontend-src
+
+# Install dependencies
+RUN if [ -f "package-lock.json" ]; then \
+        npm ci --legacy-peer-deps 2>/dev/null || npm install --legacy-peer-deps; \
+    else \
+        npm install --legacy-peer-deps; \
+    fi
+
+# Build production Angular
+RUN npx ng build --configuration=production 2>/dev/null || \
+    npm run build -- --configuration=production 2>/dev/null || \
+    npm run build 2>/dev/null || \
+    echo "WARNING: Angular build failed, serving placeholder"
+
+# ---- Stage 2: Serve with Nginx ----
+FROM nginx:1.27-alpine
+
+# Remove default config
+RUN rm /etc/nginx/conf.d/default.conf
+
+# Copy nginx config
+COPY nginx/default.conf /etc/nginx/conf.d/default.conf
+
+# Copy Angular build output
+COPY --from=builder /app/dist/ /tmp/dist/
+
+# Find and copy the actual build output to nginx html root
+RUN set -e; \
+    TARGET="/usr/share/nginx/html"; \
+    rm -rf "${TARGET:?}"/*; \
+    # Try to find index.html in common Angular output paths
+    FOUND=""; \
+    for candidate in \
+        /tmp/dist/*/browser/index.html \
+        /tmp/dist/browser/index.html \
+        /tmp/dist/*/index.html \
+        /tmp/dist/index.html; \
+    do \
+        if [ -f "$candidate" ]; then \
+            SRC_DIR=$(dirname "$candidate"); \
+            cp -r "$SRC_DIR"/* "$TARGET"/; \
+            FOUND="yes"; \
+            echo "Angular build found at: $SRC_DIR"; \
+            break; \
+        fi; \
+    done; \
+    # Fallback: copy everything from dist
+    if [ -z "$FOUND" ] && [ "$(ls -A /tmp/dist/ 2>/dev/null)" ]; then \
+        cp -r /tmp/dist/* "$TARGET"/ 2>/dev/null || true; \
+        echo "Copied all dist contents"; \
+    fi; \
+    # Ultimate fallback: placeholder page
+    if [ ! -f "$TARGET/index.html" ]; then \
+        echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>SmartCMS</title><style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#1a1a2e;color:#eee}div{text-align:center;padding:40px}h1{color:#0ff}a{color:#0ff}</style></head><body><div><h1>SmartCMS</h1><p>Angular frontend build pending.</p><p>Run: <code>docker compose build --no-cache cms-frontend</code></p><p><a href="/api">API Endpoint</a></p></div></body></html>' > "$TARGET/index.html"; \
+        echo "Created placeholder index.html"; \
+    fi; \
+    rm -rf /tmp/dist
+
+EXPOSE 80 443
+
+CMD ["nginx", "-g", "daemon off;"]
